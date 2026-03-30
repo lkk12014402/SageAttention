@@ -12,6 +12,40 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * ---------------------------------------------------------------------------
+ * mainloop_tma_ws.h — Collective mainloop for Blackwell FP4 attention
+ * ---------------------------------------------------------------------------
+ * This file implements CollectiveMainloopFwd, which encapsulates:
+ *
+ *  load()  — Producer side: asynchronously load Q, K, V, scale factors,
+ *             and ΔS from global memory into SMEM via TMA.
+ *
+ *  mma()   — Consumer side: execute the attention computation for one
+ *             output tile (m_block, head, batch):
+ *
+ *    For n_block = n_block_max-1 downto 0:
+ *      (1) S = Q_fp4 ⊗ K_fp4 + ΔS_block     (FP4 MMA, §3.3)
+ *      (2) Causal/padding masking on S
+ *      (3) online_softmax_with_quant(S)        (update m, l, compute SFP, §3.4)
+ *      (4) P_fp4 = quantize(S, SFP)           (two-level P quant)
+ *      (5) O = P_fp4 ⊗ V^T_fp4               (FP4 MMA, §3.3)
+ *      (6) O_store = O_store * scores_scale + O  (merge partial sums)
+ *    O_final = O_store / row_sum               (softmax normalisation)
+ *
+ * Key helper lambdas defined inside mma():
+ *   copy_k_block(block_id) — loads K[block_id] + SFK from SMEM to registers
+ *   copy_v_block(block_id) — loads V^T[block_id] + SFVt from SMEM to registers
+ *   add_delta_s(acc)       — initialises the S accumulator with the ΔS tile,
+ *                            implementing the Smooth Q/K correction (§3.1):
+ *                              S_init = ΔS = Q_mean @ K^T
+ *   quantize(mma_k, view) — converts P tile at stage mma_k to FP4+FP8 format
+ *
+ * TMA pipeline:
+ *   Q uses a 1-stage pipeline (loaded once per output tile).
+ *   K and V use kStages-stage pipelines for software pipelining.
+ *   The Producer warp issues TMA copies; the Consumer warp waits on
+ *   pipeline barriers before accessing the data.
  */
 
 #pragma once
@@ -682,12 +716,26 @@ struct CollectiveMainloopFwd {
             copy(smem_tiled_copy_V, tOsVt_stage(_, _, block_id), tOrVt_copy_view(_, _, block_id));
             copy(smem_tiled_copy_SFV, tOsSFVt_stage(_, _, block_id), tOrSFVt_copy_view(_, _, block_id));
         };
-        // auto gemm_qk = [&](auto block_id) {
-        //     cute::gemm(tiled_mma_qk, make_zip_tensor(tSrQ(_, _, block_id), tSrSFQ(_, _, block_id)), make_zip_tensor(tSrK(_, _, block_id), tSrSFK(_, _, block_id)), tSrS);
-        // };
-        // auto gemm_pv = [&](auto block_id) {
-        //     cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, block_id), tOrSFP(_, _, block_id)), make_zip_tensor(tOrVt(_, _, block_id), tOrSFVt(_, _, block_id)), tOrO);
-        // };
+        // ----------------------------------------------------------------
+        // add_delta_s: initialise the S accumulator with ΔS (FP32 correction).
+        //
+        // ΔS = Q_mean @ K^T  (precomputed in Python by preprocess_qkv).
+        // Because Q was smoothed (Q̃ = Q - Q_mean), the true scores are:
+        //   S_true = Q @ K^T = Q̃ @ K^T + Q_mean @ K^T = S_fp4_mma + ΔS
+        //
+        // This lambda loads the relevant ΔS tile from SMEM and writes it
+        // directly into the FP32 accumulator registers *before* the MMA,
+        // so that the MMA result is S_true (accumulated from ΔS as initial value).
+        //
+        // Thread layout note:
+        //   acc is partitioned by tiled_mma_qk.  Each thread owns a 4×8 sub-tile.
+        //   quad_id = threadIdx.x % 4 determines which row group.
+        //   The loop over i=0..3 covers the 4 column groups.
+        //   Two rows (acc[..., _0{}] and acc[..., _1{}]) share the same ΔS
+        //   because ΔS has a broadcast stride along M (SmemLayoutAtomDS uses
+        //   Stride<_0, _1>), meaning the same row of ΔS is used for both
+        //   MMA sub-rows within a 2×1 atom tile.
+        // ----------------------------------------------------------------
         auto add_delta_s = [&](auto& acc) {
             auto tSsDS_stage = recast<float4>(sDS(_, _, smem_pipe_read_k.index()));
             auto acc_float4 = recast<float4>(acc);
@@ -703,19 +751,36 @@ struct CollectiveMainloopFwd {
             }
         };
         consumer_wait(pipeline_q, smem_pipe_read_q);
+        // Load Q tile (FP4 data + FP8 scale factors) from SMEM to registers
         copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
         copy(smem_tiled_copy_SFQ, tSsSFQ, tSrSFQ_copy_view);
         pipeline_q.consumer_release(smem_pipe_read_q);
         ++smem_pipe_read_q;
 
         Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+        // Reinterpret S accumulator for element-wise operations (exp, scale, quantise)
         Tensor tSrS_converion_view = make_tensor(tSrS.data(), flash::convert_to_conversion_layout(tSrS.layout()));
+        // AbsMaxP: per-group absolute maxima for P.  Shape: [Rows, kBlockN/16].
+        // One entry per 1×16 micro-group of P along the N dimension.
+        // Used by online_softmax_with_quant to compute per-group FP8 scale factors.
         Tensor AbsMaxP = make_tensor_like<float>(
             make_layout(shape(group<1, 4>(flatten(tSrS_converion_view.layout()(make_coord(_0{}, _), _, _)))))
         );
         consumer_wait(pipeline_k, smem_pipe_read_k);
+        // Copy first K block from SMEM to registers (data + FP8 scale factors)
         copy_k_block(_0{});
+        // Initialise S accumulator with ΔS correction (from Smooth Q/K, §3.1):
+        //   S_init = ΔS_block   (will be overwritten by add_delta_s which sets accumulator)
+        // Note: the FP4 MMA accumulates *into* tSrS, so the delta_s is loaded
+        // as the initial value of the accumulator before any MMA instruction runs.
         add_delta_s(tSrS);
+        // ----------------------------------------------------------------
+        // QK FP4 matmul: S = Q_fp4 ⊗ K_fp4 + ΔS
+        //   tiled_mma_qk uses SM120_16x32x64_TN_VS_NVFP4
+        //   zip_tensor pairs (FP4 data, FP8 scale) as the MMA operand
+        //   Inner loop over k_block covers the full head_dim = kHeadDim
+        //   kHeadDim / (atom_K=64) = kHeadDim / 64 iterations
+        // ----------------------------------------------------------------
         CUTLASS_PRAGMA_UNROLL
         for (int k_block = 0; k_block < size<2>(tSrQ); ++k_block) {
             cute::gemm(tiled_mma_qk, make_zip_tensor(tSrQ(_, _, k_block), tSrSFQ(_, _, k_block)), 
@@ -729,6 +794,12 @@ struct CollectiveMainloopFwd {
         }
         
          
+        // ----------------------------------------------------------------
+        // Causal masking: zero-out positions that should not be attended.
+        //   For non-causal: mask tokens beyond the actual K sequence length.
+        //   For causal:     mask tokens where col > row + seqlen_k - seqlen_q.
+        // After masking, S[masked] = -∞ → exp(-∞) = 0 → no contribution.
+        // ----------------------------------------------------------------
         auto col_limit_causal = [&](int row, int n_block) {
             return row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
         };
@@ -747,11 +818,34 @@ struct CollectiveMainloopFwd {
                 }
             }
         }
+
+        // ----------------------------------------------------------------
+        // quantize: two-level P quantisation (§3.4 of the paper)
+        //
+        // This lambda performs the Level 1 + Level 2 quantisation of a
+        // sub-tile of P corresponding to MMA K-block `mma_k`:
+        //
+        // Level 1 (per-token, via AbsMaxP):
+        //   fp8_scale_p_group = AbsMaxP(mi, ni)  (already normalised by
+        //     online_softmax_with_quant to cover the range [0, 6])
+        //
+        // Level 2 (per-group FP8 → FP4):
+        //   SFP = fp8_e4m3_encode(AbsMaxP_stagek)  → 4 values → 1 uint32
+        //   P_fp4 = fp4_e2m1_encode(acc_stagek / AbsMaxP)
+        //         = fp32_vec_to_e2m1(8 values → 1 uint32)
+        //
+        // Thread cooperation for SFP:
+        //   The SM120 block-scaled MMA expects two adjacent threads (a "quad
+        //   pair") to jointly hold one FP8 scale: thread at (quad_id & 1)==0
+        //   holds bytes [0:2] and the other holds bytes [2:4].
+        //   The __shfl_xor_sync with mask=2 exchanges between them.
+        // ----------------------------------------------------------------
         auto quantize = [&](auto mma_k, auto acc_conversion_view) {
             Tensor AbsMaxP_stagek = AbsMaxP(_, make_coord(_, _, mma_k));
             Tensor acc_conversion_stagek = acc_conversion_view(_, _, mma_k);
             Tensor SFP = make_tensor_like<cutlass::float_ue4m3_t>(AbsMaxP_stagek.layout());
             Tensor SFP_uint32_view = recast<uint32_t>(SFP);
+            // Encode 4 AbsMaxP values into 4 FP8 e4m3 bytes packed as uint32
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(AbsMaxP_stagek); i += 4) {
                 uint32_t& tmp = SFP_uint32_view(i / 4);
@@ -763,7 +857,9 @@ struct CollectiveMainloopFwd {
                     tmp
                 );
             }
+            // quad_id ∈ {0,1,2,3}: identifies thread's position within a 4-thread quad
             int const quad_id = threadIdx.x & 3;
+            // MASK selects the relevant bytes from the FP8 scale word for this thread
             uint32_t MASK = (0xFF00FF) << ((quad_id & 1) * 8);
             Tensor tOrSFP_uint32_view = recast<uint32_t>(tOrSFP(_, _, mma_k));
             Tensor tOrP_uint32_view = recast<uint32_t>(tOrP(_, _, mma_k));
@@ -772,6 +868,7 @@ struct CollectiveMainloopFwd {
             for (int mma_m = 0; mma_m < size<1>(tOrP); ++mma_m) {
                     CUTLASS_PRAGMA_UNROLL
                     for (int i = 0; i < 4; ++i) {
+                        // Pack 8 consecutive FP32 acc values into one uint32 of FP4 e2m1
                         flash::packed_float_to_e2m1(
                             acc_conversion_stagek(make_coord(_0{}, i), mma_m),
                             acc_conversion_stagek(make_coord(_1{}, i), mma_m),
@@ -784,6 +881,8 @@ struct CollectiveMainloopFwd {
                             tOrP_uint32_view(i, mma_m)
                         );
                     }
+                    // Combine FP8 scale bytes from this thread and its pair thread:
+                    // the MMA atom expects scales from two adjacent threads interleaved
                     uint32_t local_sfp = SFP_uint32_view(_0{}, _0{}, mma_m);
                     uint32_t peer_sfp  = __shfl_xor_sync(int32_t(-1), local_sfp, 2);
                     if ((quad_id & 1) == 0) {
@@ -796,11 +895,28 @@ struct CollectiveMainloopFwd {
             }
         };
 
+        // ----------------------------------------------------------------
+        // First tile: online softmax + P quantisation
+        //   online_softmax_with_quant<FirstTile=true> initialises m, l
+        //   and computes AbsMaxP (per-group FP8 scales for P).
+        //   Uses InfCheck=true for the first tile in case the last K-block
+        //   has causal masking that produces -inf rows.
+        // ----------------------------------------------------------------
         softmax_fused.template online_softmax_with_quant</*Is_first=*/true>(tSrS, AbsMaxP, mainloop_params.softmax_scale_log2);
 
         consumer_wait(pipeline_v, smem_pipe_read_v);
+        // Copy first V^T block from SMEM to registers
         copy_v_block(_0{});
+        // Quantise the first P sub-tile (mma_k=0) to FP4
         quantize(_0{}, tSrS_converion_view);
+        // ----------------------------------------------------------------
+        // PV FP4 matmul: O = P_fp4 ⊗ V^T_fp4
+        //   tiled_mma_pv uses the same SM120_16x32x64_TN_VS_NVFP4 atom.
+        //   zip_tensor pairs (FP4 P data, FP8 SFP) as operand A.
+        //   zip_tensor pairs (FP4 V^T data, FP8 SFVt) as operand B.
+        //   Loop over v_block covers kHeadDim / 64 iterations.
+        //   The result tOrO_store accumulates in FP32.
+        // ----------------------------------------------------------------
         CUTLASS_PRAGMA_UNROLL
         for (int v_block = 0; v_block < size<2>(tOrP); ++v_block) {
             cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, v_block), tOrSFP(_, _, v_block)), 
@@ -815,6 +931,12 @@ struct CollectiveMainloopFwd {
         }
         
         n_block--;
+        // ----------------------------------------------------------------
+        // n_masking_steps: for causal attention, there may be 1–2 additional
+        // K-blocks that require partial causal masking (where some rows are
+        // fully masked and others are not).  For non-causal, n_masking_steps=1
+        // so this loop is skipped entirely.
+        // ----------------------------------------------------------------
         constexpr int n_masking_steps = !Is_causal ? 1 : cute::ceil_div(kBlockM, kBlockN) + 1;
         // // Only go through these if Is_causal, since n_masking_steps = 1 when !Is_causal
         CUTLASS_PRAGMA_UNROLL
@@ -861,6 +983,12 @@ struct CollectiveMainloopFwd {
             if (masking_step > 0) { softmax_fused.rescale_o(tOrO_store, tOrO); }
         }
 
+        // ----------------------------------------------------------------
+        // Main K-block loop (no masking required, #pragma unroll 1 to
+        // avoid code bloat for the inner loop which is not short)
+        // Processes all remaining K-blocks with online softmax + P quant + PV.
+        // After each block, rescale_o merges the partial O accumulator.
+        // ----------------------------------------------------------------
         #pragma unroll 1
         for (; n_block >= 0; --n_block) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
@@ -898,6 +1026,7 @@ struct CollectiveMainloopFwd {
             }
             softmax_fused.rescale_o(tOrO_store, tOrO);
         }
+        // Finalise: apply 1/row_sum normalisation to complete the softmax
         softmax_fused.finalize(tOrO_store);
         return;
     }
