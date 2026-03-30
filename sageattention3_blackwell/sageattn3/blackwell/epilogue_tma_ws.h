@@ -12,6 +12,29 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * ---------------------------------------------------------------------------
+ * epilogue_tma_ws.h — Output epilogue for Blackwell FP4 attention
+ * ---------------------------------------------------------------------------
+ * CollectiveEpilogueFwd handles writing the final attention output O from
+ * registers/SMEM to global memory.  Two methods are used:
+ *
+ *   mma_store(shared_storage, tiled_mma_pv, tOrO, thread_idx)
+ *     Called by the Consumer warp-group after softmax_fused.finalize().
+ *     Converts the FP32 O accumulator to FP16/BF16 and writes it to SMEM
+ *     using the STSM (store shared matrix) instruction, which is bank-
+ *     conflict-free for the swizzled SmemLayoutO.
+ *
+ *   tma_store(shared_storage, epilogue_params, work_tile_info, ...)
+ *     Called by the Epilogue warp of the Producer warp-group after
+ *     receiving the barrier_o signal from the Consumer.
+ *     Issues a TMA store to copy the O tile from SMEM to global memory.
+ *
+ *   store_zero(epilogue_params, thread_idx, block_coord)
+ *     Called for causal tiles that are fully below the diagonal (no valid
+ *     attention positions).  Writes zeros to O and +inf to LSE.
+ *
+ * Output shape: O[B, H, QL_padded, D], dtype = ElementOut (float16/bfloat16)
  */
 
 #pragma once

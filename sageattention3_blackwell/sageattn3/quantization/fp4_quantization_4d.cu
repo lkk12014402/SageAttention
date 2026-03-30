@@ -12,6 +12,54 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * ---------------------------------------------------------------------------
+ * fp4_quantization_4d.cu — FP4 microscaling quantisation kernels
+ * ---------------------------------------------------------------------------
+ * Implements the FP4 microscaling quantisation step from SageAttention3 §3.2.
+ *
+ * Three kernels are provided, all performing the same mathematical operation
+ * but with different output layouts required by the Blackwell attention kernel:
+ *
+ *   scaled_fp4_quant_kernel<permute=false>  → scaled_fp4_quant()
+ *     Plain layout: output[B, H, N, D//2], scale[B, H, N, D//16]
+ *     Used for Q.
+ *
+ *   scaled_fp4_quant_kernel<permute=true>   → scaled_fp4_quant_permute()
+ *     Permuted layout: token indices within each 32-row group are reordered
+ *     so that the blockscaled interleaved format required for MMA operand B
+ *     (K matrix) is correct.
+ *     Used for K.
+ *
+ *   scaled_fp4_quant_trans_kernel           → scaled_fp4_quant_trans()
+ *     Transposed layout: output[B, H, D, N//2], scale[B, H, D, N//16]
+ *     V is stored head_dim-major so that P @ V^T can be computed with the
+ *     standard FP4 tensor core where the inner product runs over tokens (N).
+ *     Used for V.
+ *
+ * Microscaling algorithm (per group of 16 elements along head_dim):
+ *   1. Load 16 elements from input  (as 8×half2 packed vectors)
+ *   2. Compute group maximum: s = max(|x_i|, i=0..15)
+ *   3. Scale factor: SFValue = s / 6.0   (6.0 = max FP4 e2m1 value)
+ *   4. Round-trip SFValue through FP8 e4m3 (store then reload) to simulate
+ *      the precision loss of storing the scale as FP8.
+ *   5. Divide each element by SFValue: y_i = x_i / SFValue
+ *   6. Convert each y_i to FP4 e2m1 using the PTX instruction:
+ *        cvt.rn.satfinite.e2m1x2.f32   (converts two FP32 values to 2×FP4)
+ *   7. Pack 8 FP4 values into a 32-bit uint32 (two per byte)
+ *   8. Store packed FP4 data and FP8 scale factor in the blockscaled layout.
+ *
+ * Blockscaled scale factor storage layout:
+ *   Scale factors must be stored in the specific interleaved format consumed
+ *   by the SM120 blockscaled MMA atom.  The offset formula:
+ *     offset = (col_id_local / 4) * 256 + (col_id_local % 4)
+ *            + (token_id_local / 16) * 4 + (token_id_local % 16) * 16
+ *   groups 64 tokens × 1 scale into a 256-byte tile, interleaved such that
+ *   each warp can load exactly one scale per thread in a single LDSM.
+ *
+ * CVT_FP4_ELTS_PER_THREAD = 16:
+ *   Each thread processes 16 elements, which equals the group size.
+ *   Therefore one thread computes exactly one FP8 scale factor.
  */
 #include <torch/all.h>
 #include <torch/python.h>
@@ -73,7 +121,17 @@
 
 constexpr int CVT_FP4_ELTS_PER_THREAD = 16;
 
-// Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
+// -------------------------------------------------------------------------
+// fp32_vec_to_e2m1: convert 8 float32 values (as 4×float2) to 8 FP4 e2m1
+// values packed into a single uint32 (2 FP4 values per byte).
+//
+// Uses the PTX instruction cvt.rn.satfinite.e2m1x2.f32 which converts two
+// FP32 inputs to two FP4 e2m1 values and packs them into a byte.  Four such
+// conversions produce one 32-bit word.
+//
+// Note: __CUDA_ARCH__ >= 1000 is Blackwell (SM100+). On older GPUs this
+// returns 0 (not supported).
+// -------------------------------------------------------------------------
 inline __device__ uint32_t fp32_vec_to_e2m1(float2 *array) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   uint32_t val;
@@ -140,6 +198,20 @@ __global__ void scaled_fp4_quant_kernel(
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 input are supported");
   using PackedVec = PackedVec<T>;
 
+  // -----------------------------------------------------------------------
+  // Thread/block mapping:
+  //   blockIdx.y → batch index (bidb)
+  //   blockIdx.z → head  index (bidh)
+  //   blockIdx.x → token-block index  (covers BLOCK_SIZE tokens per block)
+  //
+  // Within the block:
+  //   Each group of NUM_THREADS_PER_TOKEN consecutive threads handles
+  //   one token (all head_dim elements).
+  //   threadIdx.x / NUM_THREADS_PER_TOKEN → local token within the block
+  //   threadIdx.x % NUM_THREADS_PER_TOKEN → which D-slice of the token
+  //     Each D-slice is CVT_FP4_ELTS_PER_THREAD=16 elements, i.e. one
+  //     micro-group (the unit of FP4 microscaling).
+  // -----------------------------------------------------------------------
   const int batch_id = blockIdx.y;
   const int head_id = blockIdx.z;
   const int token_block_id = blockIdx.x;
@@ -149,18 +221,24 @@ __global__ void scaled_fp4_quant_kernel(
   static_assert(sizeof(PackedVec) == sizeof(T) * CVT_FP4_ELTS_PER_THREAD,
                 "Vec size is not matched.");
 
+  // Number of threads responsible for a single token's head_dim elements
   constexpr uint32_t NUM_THREADS_PER_TOKEN = head_dim / CVT_FP4_ELTS_PER_THREAD;
 
-  // load input
+  // Global token index for this thread (before permutation)
   const int token_id = token_block_id * BLOCK_SIZE + threadIdx.x / NUM_THREADS_PER_TOKEN;
   
   int load_token_id;
   if constexpr (!permute) {
+    // Plain (non-permuted) layout: load token in natural order
     load_token_id = token_id;
   } else {
+    // Permuted layout for K: reorder tokens within each 32-row sub-block so
+    // that the blockscaled K tensor is in the correct interleaved format for
+    // the SM120 MMA atom's B operand.
+    // Permutation within each group of 32 tokens:
+    //   [0,1,8,9,16,17,24,25, 2,3,10,11,18,19,26,27, 4,5,12,13,..., 6,7,14,15,22,23,30,31]
     int local_token_id = threadIdx.x / NUM_THREADS_PER_TOKEN;
     int local_token_id_residue = local_token_id % 32;
-    // [0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29, 6, 7, 14, 15, 22, 23, 30, 31]
     load_token_id = token_block_id * BLOCK_SIZE + (local_token_id / 32) * 32 +
                     (local_token_id_residue / 8) * 2 + 
                     ((local_token_id_residue % 8) / 2) * 8 +
@@ -169,19 +247,28 @@ __global__ void scaled_fp4_quant_kernel(
 
   PackedVec in_vec;
   
+  // Zero-pad the vector (handles out-of-bounds tokens with all zeros)
   #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
     reinterpret_cast<uint32_t&>(in_vec.elts[i]) = 0;
   }
   
   if (load_token_id < num_tokens) {
+    // Load CVT_FP4_ELTS_PER_THREAD=16 elements (as 8×half2) for this micro-group
+    // This corresponds to 1×16 micro-group in head_dim dimension (§3.2 of paper)
     in_vec = reinterpret_cast<PackedVec const*>(input + 
                                           batch_id * stride_bz_input + // batch dim
                                           head_id * stride_h_input +   // head dim
                                           load_token_id * stride_seq_input + // seq dim
-                                          (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD)[0]; // feature dim
+                                          (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD)[0]; // feature dim (16 elements)
   }
 
+  // -----------------------------------------------------------------------
+  // Step 1: compute group maximum  max(|x_i|, i=0..15)
+  //
+  // We use __habs2/__hmax2 to process two half-precision values at a time.
+  // The loop reduces across the 8 half2 values in in_vec.
+  // -----------------------------------------------------------------------
   // calculate max of every consecutive 16 elements
   auto localMax = __habs2(in_vec.elts[0]);
   #pragma unroll
@@ -189,20 +276,35 @@ __global__ void scaled_fp4_quant_kernel(
     localMax = __hmax2(localMax, __habs2(in_vec.elts[i]));
   }
 
-  if constexpr (CVT_FP4_ELTS_PER_THREAD == 8) { // shuffle across two threads
+  if constexpr (CVT_FP4_ELTS_PER_THREAD == 8) {
+    // When each thread only holds 8 elements, two adjacent threads share
+    // one 16-element micro-group → exchange max via shuffle
     localMax = __hmax2(__shfl_xor_sync(0xffffffff, localMax, 1, 32), localMax);
   }
 
+  // Reduce the half2 to a single float maximum
   float vecMax = float(__hmax(localMax.x, localMax.y));
 
+  // -----------------------------------------------------------------------
+  // Step 2: compute FP8 e4m3 scale factor
+  //   SFValue = vecMax / 6.0   (6.0 = max representable FP4 e2m1 value)
+  //
+  // Round-trip through FP8 e4m3 to simulate the precision of storing the
+  // scale.  This ensures that the reconstruction error at decode time
+  // exactly matches what the hardware will compute.
+  // -----------------------------------------------------------------------
   // scaling factor
   float SFValue = vecMax / 6.0f;
   uint8_t SFValueFP8;
-  reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8) = __nv_fp8_e4m3(SFValue);
-  SFValue = float(reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8));
+  reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8) = __nv_fp8_e4m3(SFValue);  // encode to FP8
+  SFValue = float(reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8));            // decode back to float
 
   float SFValueInv = (SFValue == 0.0f) ? 0.0f : 1.0f / SFValue;
 
+  // -----------------------------------------------------------------------
+  // Step 3: divide elements by scale factor, convert to float2 for PTX
+  //   y_i = x_i / SFValue   → each y_i ∈ [-6, 6]
+  // -----------------------------------------------------------------------
   // convert input to float2 and apply scale
   float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
 
@@ -217,6 +319,11 @@ __global__ void scaled_fp4_quant_kernel(
     fp2Vals[i].y = fp2Vals[i].y * SFValueInv;
   }
 
+  // -----------------------------------------------------------------------
+  // Step 4: convert to FP4 e2m1 using PTX cvt.rn.satfinite.e2m1x2.f32
+  //   Two FP32 → one byte (two FP4 packed, lower nibble = first value)
+  //   8 FP4 values → 4 bytes = 1 uint32 per call to fp32_vec_to_e2m1
+  // -----------------------------------------------------------------------
   // convert to e2m1
   uint32_t e2m1Vals[CVT_FP4_ELTS_PER_THREAD / 8];
   #pragma unroll
@@ -224,6 +331,9 @@ __global__ void scaled_fp4_quant_kernel(
     e2m1Vals[i] = fp32_vec_to_e2m1(fp2Vals + i * 4);
   }
 
+  // -----------------------------------------------------------------------
+  // Step 5: store packed FP4 data
+  // -----------------------------------------------------------------------
   // save, do not check range
   if constexpr (CVT_FP4_ELTS_PER_THREAD == 8) {
     reinterpret_cast<uint32_t*>(output + 
@@ -239,6 +349,21 @@ __global__ void scaled_fp4_quant_kernel(
                                 (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD / 2)[0] = reinterpret_cast<uint64_t*>(e2m1Vals)[0];
   }
   
+  // -----------------------------------------------------------------------
+  // Step 6: store FP8 scale factor in the blockscaled interleaved format.
+  //
+  // The SM120 MMA atom requires scale factors in a specific interleaved
+  // layout where groups of 64 tokens × 1 scale occupy 256 bytes.
+  // The offset formula maps (token_id_local, col_id_local) to this layout:
+  //   offset = (col_id_local / 4) * 256  ← which 256-byte group (D-major)
+  //          + (col_id_local % 4)         ← position within the 4 columns
+  //          + (token_id_local / 16) * 4  ← which row-group of 16 tokens
+  //          + (token_id_local % 16) * 16 ← position within the 16-token group
+  //
+  // token_id_local is the token index within the current 64-token super-block
+  // (since we process BLOCK_SIZE tokens per CUDA block, token_id % 64 gives
+  // the position within a 64-row tile).
+  // -----------------------------------------------------------------------
   uint8_t* output_sf_save_base = output_sf + batch_id * stride_bz_output_sf + head_id * stride_h_output_sf + (token_id / 64) * 64 * stride_seq_output_sf;
   uint32_t token_id_local = token_id % 64;
 
@@ -267,6 +392,24 @@ __global__ void scaled_fp4_quant_trans_kernel(
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 input are supported");
   using PackedVec = PackedVec<T>;
 
+  // -----------------------------------------------------------------------
+  // Thread/block mapping for transposed V quantisation:
+  //   blockIdx.y → batch index (bidb)
+  //   blockIdx.z → head  index (bidh)
+  //   blockIdx.x → token-block index (covers BLOCK_SIZE tokens)
+  //
+  // This kernel transposes the token and head_dim axes of V, so the output
+  // layout is [B, H, D, N//2] instead of [B, H, N, D//2].
+  //
+  // Two thread roles within a block:
+  //   - NUM_THREADS_PER_TOKEN threads read from the same token (across D)
+  //   - NUM_THREADS_PER_SEQ   threads read from the same D position (across N)
+  //
+  // The transposition is performed via shared memory (SMEM):
+  //   1. Load in natural [N, D] order into SMEM.
+  //   2. __syncthreads() to ensure all data is visible.
+  //   3. Reload in transposed [D, N] order from SMEM.
+  // -----------------------------------------------------------------------
   const int batch_id = blockIdx.y;
   const int head_id = blockIdx.z;
   const int token_block_id = blockIdx.x;
@@ -277,9 +420,10 @@ __global__ void scaled_fp4_quant_trans_kernel(
                 "Vec size is not matched.");
 
   constexpr uint32_t NUM_THREADS_PER_TOKEN = head_dim / CVT_FP4_ELTS_PER_THREAD;
+  // Number of threads needed to cover BLOCK_SIZE tokens when each thread reads CVT_FP4_ELTS_PER_THREAD seq elements
   constexpr uint32_t NUM_THREADS_PER_SEQ = BLOCK_SIZE / CVT_FP4_ELTS_PER_THREAD;
 
-  // load input
+  // Load one token per NUM_THREADS_PER_TOKEN threads (natural order)
   const int token_id = token_block_id * BLOCK_SIZE + threadIdx.x / NUM_THREADS_PER_TOKEN;
 
   PackedVec in_vec;
@@ -297,16 +441,27 @@ __global__ void scaled_fp4_quant_trans_kernel(
                                           (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD)[0]; // feature dim
   }
 
+  // -----------------------------------------------------------------------
+  // Transposition via SMEM:
+  //   Write in_vec into shared_input in row-major [N, D] order.
+  //   After __syncthreads, reload 16 elements in column-major [D, N] order.
+  //   This effectively transposes the tile.
+  // -----------------------------------------------------------------------
   // transpose
   __shared__ T shared_input[BLOCK_SIZE * head_dim];
   reinterpret_cast<PackedVec*>(shared_input)[threadIdx.x] = in_vec;
   __syncthreads();
   #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    // After transposition: thread's data is now CVT_FP4_ELTS_PER_THREAD consecutive
+    // elements along the sequence dimension for a fixed head_dim position.
+    // The formula reads: element at (d, n) = shared_input[d + n * head_dim]
     in_vec.elts[i].x = shared_input[(threadIdx.x / NUM_THREADS_PER_SEQ) + ((threadIdx.x % NUM_THREADS_PER_SEQ) * CVT_FP4_ELTS_PER_THREAD + 2 * i) * head_dim];
     in_vec.elts[i].y = shared_input[(threadIdx.x / NUM_THREADS_PER_SEQ) + ((threadIdx.x % NUM_THREADS_PER_SEQ) * CVT_FP4_ELTS_PER_THREAD + 2 * i + 1) * head_dim];
   }
 
+  // The same microscaling steps as the non-transposed kernel:
+  // compute max of the 16-element group (now along the seq dimension)
   // calculate max of every consecutive 16 elements
   auto localMax = __habs2(in_vec.elts[0]);
   #pragma unroll
@@ -320,7 +475,7 @@ __global__ void scaled_fp4_quant_trans_kernel(
 
   float vecMax = float(__hmax(localMax.x, localMax.y));
 
-  // scaling factor
+  // scaling factor: SFValue = max / 6.0 → stored as FP8 e4m3
   float SFValue = vecMax / 6.0f;
   uint8_t SFValueFP8;
   reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8) = __nv_fp8_e4m3(SFValue);
@@ -349,6 +504,7 @@ __global__ void scaled_fp4_quant_trans_kernel(
     e2m1Vals[i] = fp32_vec_to_e2m1(fp2Vals + i * 4);
   }
 
+  // Store packed FP4 in transposed [D, N//2] layout
   // save
   if constexpr (CVT_FP4_ELTS_PER_THREAD == 8) {
     reinterpret_cast<uint32_t*>(output + 
@@ -364,6 +520,8 @@ __global__ void scaled_fp4_quant_trans_kernel(
                                 (token_block_id * BLOCK_SIZE + (threadIdx.x % NUM_THREADS_PER_SEQ) * CVT_FP4_ELTS_PER_THREAD) / 2)[0] = reinterpret_cast<uint64_t*>(e2m1Vals)[0];
   }
 
+  // Store FP8 scale factors in blockscaled layout (same formula as non-transposed,
+  // but now row = head_dim index and col = token group index)
   uint8_t *output_sf_save_base = output_sf + 
                                 batch_id * stride_bz_output_sf +
                                 head_id * stride_h_output_sf +
